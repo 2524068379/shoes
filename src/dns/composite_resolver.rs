@@ -1,4 +1,4 @@
-//! Resolver that tries multiple DNS servers in order until one succeeds.
+//! Resolver that tries multiple DNS servers and returns the first successful answer.
 
 use std::fmt::Debug;
 use std::future::Future;
@@ -6,10 +6,13 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
+
 use crate::address::NetLocation;
 use crate::resolver::Resolver;
 
-/// Resolver that tries multiple DNS servers in order until one succeeds.
+/// Resolver that queries multiple DNS servers concurrently until one succeeds.
 pub struct CompositeResolver {
     resolvers: Vec<Arc<dyn Resolver>>,
 }
@@ -37,45 +40,61 @@ impl Resolver for CompositeResolver {
         let location = location.clone();
 
         Box::pin(async move {
-            let mut last_error = None;
+            if resolvers.is_empty() {
+                return Err(std::io::Error::other("no DNS resolvers configured"));
+            }
 
-            for (i, resolver) in resolvers.iter().enumerate() {
-                match resolver.resolve_location(&location).await {
+            let mut pending = FuturesUnordered::new();
+            for (i, resolver) in resolvers.into_iter().enumerate() {
+                let location = location.clone();
+                pending.push(async move {
+                    let resolver_debug = format!("{resolver:?}");
+                    let result = resolver.resolve_location(&location).await;
+                    (i, resolver_debug, result)
+                });
+            }
+
+            let mut errors = Vec::new();
+            while let Some((i, resolver_debug, result)) = pending.next().await {
+                match result {
                     Ok(addrs) if !addrs.is_empty() => {
                         if i > 0 {
                             log::info!(
-                                "CompositeResolver: resolved {} via resolver #{} ({:?}) after {} failures",
+                                "CompositeResolver: resolved {} via resolver #{} ({})",
                                 location,
                                 i,
-                                resolver,
-                                i
+                                resolver_debug
                             );
                         }
                         return Ok(addrs);
                     }
                     Ok(_) => {
                         log::debug!(
-                            "CompositeResolver: resolver #{} ({:?}) returned empty for {}, trying next",
+                            "CompositeResolver: resolver #{} ({}) returned empty for {}",
                             i,
-                            resolver,
+                            resolver_debug,
                             location
                         );
-                        last_error = Some(std::io::Error::other("empty response"));
+                        errors.push(format!("resolver #{i} returned empty response"));
                     }
                     Err(e) => {
                         log::debug!(
-                            "CompositeResolver: resolver #{} ({:?}) failed for {}: {}, trying next",
+                            "CompositeResolver: resolver #{} ({}) failed for {}: {}",
                             i,
-                            resolver,
+                            resolver_debug,
                             location,
                             e
                         );
-                        last_error = Some(e);
+                        errors.push(format!("resolver #{i} failed: {e}"));
                     }
                 }
             }
 
-            Err(last_error.unwrap_or_else(|| std::io::Error::other("no DNS resolvers configured")))
+            Err(std::io::Error::other(format!(
+                "all DNS resolvers failed for {}: {}",
+                location,
+                errors.join("; ")
+            )))
         })
     }
 }

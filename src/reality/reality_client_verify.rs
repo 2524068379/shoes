@@ -345,13 +345,13 @@ mod tests {
         // Build message body: context_len (1) + list_len (3) + entry
         let body_len = 1 + 3 + entry_len;
 
-        let mut message = Vec::new();
-        // Handshake type (Certificate = 0x0b)
-        message.push(0x0b);
-        // Handshake length (3 bytes, big-endian)
-        message.push(((body_len >> 16) & 0xff) as u8);
-        message.push(((body_len >> 8) & 0xff) as u8);
-        message.push((body_len & 0xff) as u8);
+        // Handshake type (Certificate = 0x0b) + length (3 bytes, big-endian)
+        let mut message = vec![
+            0x0b,
+            ((body_len >> 16) & 0xff) as u8,
+            ((body_len >> 8) & 0xff) as u8,
+            (body_len & 0xff) as u8,
+        ];
         // certificate_request_context length = 0
         message.push(0x00);
         // certificate_list length (3 bytes)
@@ -508,11 +508,12 @@ mod tests {
         let signature = [0xABu8; 64];
         let payload_len = 2 + 2 + 64; // sig_alg + sig_len + sig
 
-        let mut message = Vec::new();
-        message.push(0x0f); // CertificateVerify type
-        message.push(0x00);
-        message.push(0x00);
-        message.push(payload_len as u8);
+        let mut message = vec![
+            0x0f, // CertificateVerify type
+            0x00,
+            0x00,
+            payload_len as u8,
+        ];
         message.push(0x08); // Ed25519 algorithm
         message.push(0x07);
         message.push(0x00); // Signature length
@@ -703,11 +704,12 @@ mod tests {
 
         // Build CertificateVerify message
         let payload_len = 2 + 2 + 64;
-        let mut cv_message = Vec::new();
-        cv_message.push(0x0f); // type
-        cv_message.push(0x00);
-        cv_message.push(0x00);
-        cv_message.push(payload_len as u8);
+        let mut cv_message = vec![
+            0x0f, // type
+            0x00,
+            0x00,
+            payload_len as u8,
+        ];
         cv_message.push(0x08); // Ed25519
         cv_message.push(0x07);
         cv_message.push(0x00); // sig len

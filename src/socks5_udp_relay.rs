@@ -25,6 +25,9 @@ const MIN_HEADER_SIZE: usize = 10;
 /// Maximum UDP packet size
 const MAX_UDP_SIZE: usize = 65535;
 
+/// Maximum invalid queued UDP packets to skip in one poll before yielding.
+const MAX_INVALID_PACKETS_PER_POLL: usize = 32;
+
 /// Parse a SOCKS5 UDP packet header, returning the target location and payload slice.
 ///
 /// Packet format:
@@ -248,69 +251,74 @@ impl AsyncReadTargetedMessage for Socks5UdpRelayStream {
     ) -> Poll<std::io::Result<NetLocation>> {
         let this = self.get_mut();
 
-        match Pin::new(&mut this.receiver).poll_recv(cx) {
-            Poll::Ready(Some((packet, from_addr))) => {
-                // Learn/verify client address
-                if let Some(expected) = this.client_addr {
-                    if from_addr != expected {
-                        // Packet from unexpected source, ignore
-                        log::debug!(
-                            "SOCKS5 UDP relay: ignoring packet from {} (expected {})",
-                            from_addr,
-                            expected
-                        );
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
+        for _ in 0..MAX_INVALID_PACKETS_PER_POLL {
+            match Pin::new(&mut this.receiver).poll_recv(cx) {
+                Poll::Ready(Some((packet, from_addr))) => {
+                    // Learn/verify client address.
+                    if let Some(expected) = this.client_addr {
+                        if from_addr != expected {
+                            // Packet from unexpected source, ignore and drain another queued packet
+                            // if one is immediately available.
+                            log::debug!(
+                                "SOCKS5 UDP relay: ignoring packet from {} (expected {})",
+                                from_addr,
+                                expected
+                            );
+                            continue;
+                        }
+                    } else {
+                        // Learn client address from first packet.
+                        log::debug!("SOCKS5 UDP relay: learned client address: {}", from_addr);
+                        this.client_addr = Some(from_addr);
                     }
-                } else {
-                    // Learn client address from first packet
-                    log::debug!("SOCKS5 UDP relay: learned client address: {}", from_addr);
-                    this.client_addr = Some(from_addr);
-                }
 
-                match parse_socks5_udp_packet(&packet) {
-                    Ok((target, payload)) => {
-                        log::debug!(
-                            "SOCKS5 UDP relay: parsed packet, target={}, payload_len={}",
-                            target,
-                            payload.len()
-                        );
-                        // Skip empty payloads - the copy loop interprets 0-byte reads as EOF
-                        if payload.is_empty() {
-                            log::debug!("SOCKS5 UDP relay: skipping empty payload");
-                            cx.waker().wake_by_ref();
-                            return Poll::Pending;
+                    match parse_socks5_udp_packet(&packet) {
+                        Ok((target, payload)) => {
+                            log::debug!(
+                                "SOCKS5 UDP relay: parsed packet, target={}, payload_len={}",
+                                target,
+                                payload.len()
+                            );
+                            // Skip empty payloads - the copy loop interprets 0-byte reads as EOF.
+                            if payload.is_empty() {
+                                log::debug!("SOCKS5 UDP relay: skipping empty payload");
+                                continue;
+                            }
+                            if payload.len() > buf.remaining() {
+                                return Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!(
+                                        "UDP payload too large: {} > {}",
+                                        payload.len(),
+                                        buf.remaining()
+                                    ),
+                                )));
+                            }
+                            buf.put_slice(payload);
+                            return Poll::Ready(Ok(target));
                         }
-                        if payload.len() > buf.remaining() {
-                            return Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!(
-                                    "UDP payload too large: {} > {}",
-                                    payload.len(),
-                                    buf.remaining()
-                                ),
-                            )));
+                        Err(e) => {
+                            log::debug!("SOCKS5 UDP relay: failed to parse packet: {}", e);
+                            continue;
                         }
-                        buf.put_slice(payload);
-                        Poll::Ready(Ok(target))
-                    }
-                    Err(e) => {
-                        log::debug!("SOCKS5 UDP relay: failed to parse packet: {}", e);
-                        // Try to get another packet
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
                     }
                 }
+                Poll::Ready(None) => {
+                    log::debug!("SOCKS5 UDP relay: channel closed (receiver got None)");
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "UDP relay channel closed",
+                    )));
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(None) => {
-                log::debug!("SOCKS5 UDP relay: channel closed (receiver got None)");
-                Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "UDP relay channel closed",
-                )))
-            }
-            Poll::Pending => Poll::Pending,
         }
+
+        // Bound invalid-packet draining per poll so malformed traffic cannot monopolize
+        // the executor. If more packets are already queued, schedule one cooperative
+        // follow-up poll instead of spinning once per invalid datagram.
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 

@@ -53,6 +53,7 @@ impl ProxyConnectorImpl {
 
     /// Create a ProxyConnector directly from components.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn new(location: NetLocation, handler: Box<dyn TcpClientHandler>) -> Self {
         Self {
             location,

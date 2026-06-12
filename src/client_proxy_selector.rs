@@ -581,6 +581,7 @@ mod tests {
             }
         }
 
+        #[allow(dead_code)]
         fn with_mapping(mut self, hostname: &str, port: u16, addrs: Vec<IpAddr>) -> Self {
             let key = format!("{}:{}", hostname, port);
             let socket_addrs: Vec<SocketAddr> = addrs

@@ -199,23 +199,27 @@ impl Resolver for RefreshingResolver {
                         err.kind(),
                         location
                     );
-                    let _guard = refresh_lock.lock().await;
-                    match factory().await {
-                        Ok(fresh) => {
-                            *inner.write().await = fresh.clone();
-                            let addrs = fresh.resolve_location(&location).await?;
-                            *last_success_at.lock() = Some(Instant::now());
-                            Ok(addrs)
+                    let fresh = {
+                        let _guard = refresh_lock.lock().await;
+                        match factory().await {
+                            Ok(fresh) => {
+                                *inner.write().await = fresh.clone();
+                                fresh
+                            }
+                            Err(factory_err) => {
+                                log::warn!(
+                                    "RefreshingResolver ({}): error-refresh factory failed: {}",
+                                    description,
+                                    factory_err
+                                );
+                                return Err(err);
+                            }
                         }
-                        Err(factory_err) => {
-                            log::warn!(
-                                "RefreshingResolver ({}): error-refresh factory failed: {}",
-                                description,
-                                factory_err
-                            );
-                            Err(err)
-                        }
-                    }
+                    };
+
+                    let addrs = fresh.resolve_location(&location).await?;
+                    *last_success_at.lock() = Some(Instant::now());
+                    Ok(addrs)
                 }
                 Err(err) => Err(err),
             }
@@ -309,7 +313,7 @@ pub struct CachingNativeResolver {
 
 struct CachedResolveResult {
     timestamp: Instant,
-    addr: SocketAddr,
+    addrs: Vec<SocketAddr>,
 }
 
 impl std::fmt::Debug for CachingNativeResolver {
@@ -350,8 +354,8 @@ impl Resolver for CachingNativeResolver {
                 && Instant::now().duration_since(cached.timestamp)
                     <= Duration::from_secs(self.result_timeout_secs)
             {
-                let addr = cached.addr;
-                return Box::pin(async move { Ok(vec![addr]) });
+                let addrs = cached.addrs.clone();
+                return Box::pin(async move { Ok(addrs) });
             }
         }
 
@@ -372,12 +376,12 @@ impl Resolver for CachingNativeResolver {
                 )));
             }
 
-            // Cache the first result
+            // Cache the full address set so callers can fall back across all DNS answers.
             cache.lock().insert(
                 location,
                 CachedResolveResult {
                     timestamp: Instant::now(),
-                    addr: addrs[0],
+                    addrs: addrs.clone(),
                 },
             );
 
@@ -532,6 +536,7 @@ mod tests {
             }
         }
 
+        #[allow(dead_code)]
         fn count(&self) -> usize {
             self.call_count.load(Ordering::Relaxed)
         }
@@ -554,6 +559,7 @@ mod tests {
 
     /// A mock resolver that fails the first N calls then succeeds.
     #[derive(Debug)]
+    #[allow(dead_code)]
     struct FlakyResolver {
         fail_count: AtomicUsize,
         fails_remaining: AtomicUsize,
@@ -562,6 +568,7 @@ mod tests {
     }
 
     impl FlakyResolver {
+        #[allow(dead_code)]
         fn new(
             fail_first_n: usize,
             error_kind: std::io::ErrorKind,
